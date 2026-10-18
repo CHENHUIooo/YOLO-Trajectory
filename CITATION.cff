@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+title: YOLO-Trajectory
+message: >-
+  If you use this software, please cite the accompanying paper
+  (currently under review; no DOI assigned yet). The dataset DOI
+  (10.57760/sciencedb.016en) is pending registration on ScienceDB.
+type: software
+authors:
+  - given-names: Zhifu
+    family-names: Zhang
+  - given-names: Chenhui
+    family-names: Wei
+  - given-names: Yue
+    family-names: Li
+  - given-names: Junxiao
+    family-names: Liu
+  - given-names: Xirui
+    family-names: Zhang
+license: AGPL-3.0
+identifiers:
+  - type: doi
+    value: 10.57760/sciencedb.016en
+    description: Dataset DOI (ScienceDB)
+preferred-citation:
+  type: article
+  title: >-
+    A Nighttime Low-Light Rubber Tapping Trajectory Segmentation Model
+    for Rubber-Tapping Robots
+  authors:
+    - given-names: Zhifu
+      family-names: Zhang
+    - given-names: Chenhui
+      family-names: Wei
+    - given-names: Yue
+      family-names: Li
+    - given-names: Junxiao
+      family-names: Liu
+    - given-names: Xirui
+      family-names: Zhang
+  year: 2026

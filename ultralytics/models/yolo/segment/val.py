@@ -1,0 +1,420 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+
+from multiprocessing.pool import ThreadPool
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from scipy.spatial import KDTree
+from skimage.morphology import skeletonize
+
+from ultralytics.models.yolo.detect import DetectionValidator
+from ultralytics.utils import LOGGER, NUM_THREADS, ops
+from ultralytics.utils.checks import check_requirements
+from ultralytics.utils.metrics import SegmentMetrics, box_iou, mask_iou
+from ultralytics.utils.plotting import output_to_target, plot_images
+
+
+class SegmentationValidator(DetectionValidator):
+    """
+    A class extending the DetectionValidator class for validation based on a segmentation model.
+
+    Adds per-class mask IoU (mIoU) evaluation. The paper's binary image restoration framework
+    (line-mask refinement before matching) is available but disabled by default; enable it by
+    setting `validator.post_process = True`.
+
+    Example:
+        ```python
+        from ultralytics.models.yolo.segment import SegmentationValidator
+
+        args = dict(model="yolo11n-seg.pt", data="coco8-seg.yaml")
+        validator = SegmentationValidator(args=args)
+        validator()
+        ```
+    """
+
+    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
+        """Initialize SegmentationValidator and set task to 'segment', metrics to SegmentMetrics."""
+        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
+        self.plot_masks = None
+        self.process = None
+        self.args.task = "segment"
+        self.metrics = SegmentMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
+        self.use_miou = True  # compute per-class mask IoU
+        # Paper's binary image restoration framework (line-mask refinement before matching); disabled by default
+        self.post_process = False
+        self.line_width = 4  # target line width for mask restoration
+
+    def preprocess(self, batch):
+        """Preprocesses batch by converting masks to float and sending to device."""
+        batch = super().preprocess(batch)
+        batch["masks"] = batch["masks"].to(self.device).float()
+        return batch
+
+    def init_metrics(self, model):
+        """Initialize metrics and select mask processing function based on save_json flag."""
+        super().init_metrics(model)
+        self.plot_masks = []
+        if self.args.save_json:
+            check_requirements("pycocotools>=2.0.6")
+        self.process = ops.process_mask_native if self.args.save_json or self.args.save_txt else ops.process_mask
+        self.stats = dict(tp_m=[], tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
+        self.area = torch.zeros((2, self.nc), dtype=torch.float32, device=self.device)  # mIoU: [inter, union]
+
+    def get_desc(self):
+        """Return a formatted description of evaluation metrics."""
+        desc = ("%22s" + "%11s" * 10) % (
+            "Class",
+            "Images",
+            "Instances",
+            "Box(P",
+            "R",
+            "mAP50",
+            "mAP50-95)",
+            "Mask(P",
+            "R",
+            "mAP50",
+            "mAP50-95)",
+        )
+        return desc + ("%11s" % "mIoU") if self.use_miou else desc
+
+    def postprocess(self, preds):
+        """Post-processes YOLO predictions and returns output detections with proto."""
+        p = ops.non_max_suppression(
+            preds[0],
+            self.args.conf,
+            self.args.iou,
+            labels=self.lb,
+            multi_label=True,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            nc=self.nc,
+        )
+        proto = preds[1][-1] if len(preds[1]) == 3 else preds[1]  # second output is len 3 if pt, but only 1 if exported
+        return p, proto
+
+    def _prepare_batch(self, si, batch):
+        """Prepares a batch for training or inference by processing images and targets."""
+        prepared_batch = super()._prepare_batch(si, batch)
+        midx = [si] if self.args.overlap_mask else batch["batch_idx"] == si
+        prepared_batch["masks"] = batch["masks"][midx]
+        return prepared_batch
+
+    def _prepare_pred(self, pred, pbatch, proto):
+        """Prepares predictions, optionally applying the binary image restoration framework."""
+        predn = super()._prepare_pred(pred, pbatch)
+        pred_masks = self.process(proto, pred[:, 6:], pred[:, :4], shape=pbatch["imgsz"])
+
+        if self.post_process:  # binary image restoration (disabled by default)
+            refined = []
+            for mask in pred_masks.detach().cpu().numpy():
+                skeleton = self.skeletonize_mask(mask)
+                connected = self.connect_endpoints(skeleton)
+                final_mask = np.clip(self.restore_line_width(connected), 0, 1)
+                refined.append(torch.from_numpy(final_mask.astype(np.float32)))
+            pred_masks = torch.stack(refined).to(pred_masks.device)
+
+        return predn, pred_masks
+
+    def skeletonize_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Binarize, close small holes, then thin the mask to a one-pixel skeleton."""
+        _, binary = cv2.threshold(mask, 0.5, 1, cv2.THRESH_BINARY)
+        binary = binary.astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        return skeletonize(closed).astype(np.uint8)
+
+    def find_endpoints(self, skeleton: np.ndarray) -> list:
+        """Detect skeleton endpoints (points with exactly one neighbor in the 8-neighborhood)."""
+        kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 1, 1]], dtype=np.uint8)
+        conv = cv2.filter2D(skeleton, -1, kernel)
+        return [(y, x) for y, x in zip(*np.where(conv == 11))]  # center 10 + single neighbor 1 = 11
+
+    def connect_endpoints(self, skeleton: np.ndarray, max_distance=30, angle_tolerance=70) -> np.ndarray:
+        """Connect nearby endpoints whose local line directions are consistent."""
+        endpoints = self.find_endpoints(skeleton)
+        if len(endpoints) < 2:
+            return skeleton
+
+        kdtree = KDTree(endpoints)
+        connected = skeleton.copy()
+        for i, j in kdtree.query_pairs(max_distance):
+            pt1, pt2 = endpoints[i], endpoints[j]
+            if self.is_direction_consistent(pt1, pt2, skeleton, angle_tolerance):
+                cv2.line(connected, tuple(reversed(pt1)), tuple(reversed(pt2)), 1, thickness=1)
+        return connected
+
+    def is_direction_consistent(self, pt1, pt2, skeleton, angle_tolerance, window=5) -> bool:
+        """Check that the local line direction at both endpoints agrees with the connection direction."""
+        y1, x1 = pt1
+        y2, x2 = pt2
+        roi1 = skeleton[max(0, y1 - window) : y1 + window + 1, max(0, x1 - window) : x1 + window + 1]
+        roi2 = skeleton[max(0, y2 - window) : y2 + window + 1, max(0, x2 - window) : x2 + window + 1]
+
+        def get_direction(roi):
+            """Return the dominant contour orientation in degrees, or None if unavailable."""
+            contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
+            line_params = cv2.fitLine(contours[0], cv2.DIST_L2, 0, 0.01, 0.01)
+            return np.degrees(np.arctan2(line_params[1], line_params[0])) % 180
+
+        angle1 = get_direction(roi1)
+        angle2 = get_direction(roi2)
+        if angle1 is None or angle2 is None:
+            return False
+
+        connect_angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180
+
+        def diff(a, b):
+            """Angular difference on the 0-180 circle."""
+            return min(abs(a - b), 180 - abs(a - b))
+
+        return diff(angle1, connect_angle) < angle_tolerance and diff(angle2, (connect_angle + 180) % 180) < angle_tolerance
+
+    def restore_line_width(self, skeleton: np.ndarray) -> np.ndarray:
+        """Dilate the refined skeleton back to the target line width."""
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        iterations = max(1, self.line_width // 2)
+        return cv2.dilate(skeleton, kernel, iterations=iterations)
+
+    def update_metrics(self, preds, batch):
+        """Metrics."""
+        for si, (pred, proto) in enumerate(zip(preds[0], preds[1])):
+            self.seen += 1
+            npr = len(pred)
+            stat = dict(
+                conf=torch.zeros(0, device=self.device),
+                pred_cls=torch.zeros(0, device=self.device),
+                tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
+                tp_m=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
+            )
+            pbatch = self._prepare_batch(si, batch)
+            cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
+            nl = len(cls)
+            stat["target_cls"] = cls
+            stat["target_img"] = cls.unique()
+            if npr == 0:
+                if nl:
+                    for k in self.stats.keys():
+                        self.stats[k].append(stat[k])
+                    if self.args.plots:
+                        self.confusion_matrix.process_batch(detections=None, gt_bboxes=bbox, gt_cls=cls)
+                continue
+
+            # Masks
+            gt_masks = pbatch.pop("masks")
+            # Predictions
+            if self.args.single_cls:
+                pred[:, 5] = 0
+            predn, pred_masks = self._prepare_pred(pred, pbatch, proto)
+            stat["conf"] = predn[:, 4]
+            stat["pred_cls"] = predn[:, 5]
+
+            # Evaluate
+            if nl:
+                stat["tp"] = self._process_batch(predn, bbox, cls)
+                stat["tp_m"] = self._process_batch(
+                    predn, bbox, cls, pred_masks, gt_masks, self.args.overlap_mask, masks=True
+                )
+                if self.args.plots:
+                    self.confusion_matrix.process_batch(predn, bbox, cls)
+
+            for k in self.stats.keys():
+                self.stats[k].append(stat[k])
+
+            pred_masks = torch.as_tensor(pred_masks, dtype=torch.uint8)
+
+            if self.args.plots and self.batch_i < 3:
+                self.plot_masks.append(pred_masks[:15].cpu())  # filter top 15 to plot
+
+            # Save
+            if self.args.save_json:
+                self.pred_to_json(
+                    predn,
+                    batch["im_file"][si],
+                    ops.scale_image(
+                        pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(),
+                        pbatch["ori_shape"],
+                        ratio_pad=batch["ratio_pad"][si],
+                    ),
+                )
+            if self.args.save_txt:
+                self.save_one_txt(
+                    predn,
+                    pred_masks,
+                    self.args.save_conf,
+                    pbatch["ori_shape"],
+                    self.save_dir / "labels" / f'{Path(batch["im_file"][si]).stem}.txt',
+                )
+
+    def finalize_metrics(self, *args, **kwargs):
+        """Sets speed and confusion matrix for evaluation metrics."""
+        self.metrics.speed = self.speed
+        self.metrics.confusion_matrix = self.confusion_matrix
+
+    def get_stats(self):
+        """Compute per-class mIoU before collecting standard metrics."""
+        if self.use_miou:
+            self.metrics.iou = (self.area[0] / self.area[1]).tolist()
+        return super().get_stats()
+
+    def _process_batch(self, detections, gt_bboxes, gt_cls, pred_masks=None, gt_masks=None, overlap=False, masks=False):
+        """
+        Compute correct prediction matrix for a batch based on bounding boxes and optional masks.
+
+        Args:
+            detections (torch.Tensor): Tensor of shape (N, 6) representing detected bounding boxes and
+                associated confidence scores and class indices. Each row is of the format [x1, y1, x2, y2, conf, class].
+            gt_bboxes (torch.Tensor): Tensor of shape (M, 4) representing ground truth bounding box coordinates.
+                Each row is of the format [x1, y1, x2, y2].
+            gt_cls (torch.Tensor): Tensor of shape (M,) representing ground truth class indices.
+            pred_masks (torch.Tensor | None): Tensor representing predicted masks, if available. The shape should
+                match the ground truth masks.
+            gt_masks (torch.Tensor | None): Tensor of shape (M, H, W) representing ground truth masks, if available.
+            overlap (bool): Flag indicating if overlapping masks should be considered.
+            masks (bool): Flag indicating if the batch contains mask data.
+
+        Returns:
+            (torch.Tensor): A correct prediction matrix of shape (N, 10), where 10 represents different IoU levels.
+        """
+        if masks:
+            if overlap:
+                nl = len(gt_cls)
+                index = torch.arange(nl, device=gt_masks.device).view(nl, 1, 1) + 1
+                gt_masks = gt_masks.repeat(nl, 1, 1)  # shape(1,640,640) -> (n,640,640)
+                gt_masks = torch.where(gt_masks == index, 1.0, 0.0)
+            if gt_masks.shape[1:] != pred_masks.shape[1:]:
+                gt_masks = F.interpolate(gt_masks[None], pred_masks.shape[1:], mode="bilinear", align_corners=False)[0]
+                gt_masks = gt_masks.gt_(0.5)
+            iou = mask_iou(gt_masks.view(gt_masks.shape[0], -1), pred_masks.view(pred_masks.shape[0], -1))
+            if self.use_miou:
+                pred_cls = detections[:, 5]
+                h, w = gt_masks.shape[1:]
+                gt_masks_cls = torch.full((h, w), 255, dtype=gt_masks.dtype, device=gt_masks.device)
+                pred_masks_cls = torch.full((h, w), 255, dtype=gt_masks.dtype, device=gt_masks.device)
+                for i, c in enumerate(gt_cls):
+                    gt_masks_cls[gt_masks[i].bool()] = c
+
+                for i, c in enumerate(pred_cls):
+                    if c not in gt_cls:
+                        continue
+                    pred_masks_cls[pred_masks[i].bool()] = c
+
+                mask = gt_masks_cls != 255
+                pred_masks_cls, gt_masks_cls = pred_masks_cls[mask], gt_masks_cls[mask]
+
+                inter = pred_masks_cls[pred_masks_cls == gt_masks_cls]
+                inter_area = torch.histc(inter, bins=self.nc, min=0, max=self.nc - 1) if len(inter) else 0
+                pred_area = torch.histc(pred_masks_cls, bins=self.nc, min=0, max=self.nc - 1)
+                gt_area = torch.histc(gt_masks_cls, bins=self.nc, min=0, max=self.nc - 1)
+                union_area = pred_area + gt_area - inter_area
+                self.area[0] += inter_area
+                self.area[1] += union_area
+        else:  # boxes
+            iou = box_iou(gt_bboxes, detections[:, :4])
+
+        return self.match_predictions(detections[:, 5], gt_cls, iou)
+
+    def plot_val_samples(self, batch, ni):
+        """Plots validation samples with bounding box labels."""
+        plot_images(
+            batch["img"],
+            batch["batch_idx"],
+            batch["cls"].squeeze(-1),
+            batch["bboxes"],
+            masks=batch["masks"],
+            paths=batch["im_file"],
+            fname=self.save_dir / f"val_batch{ni}_labels.jpg",
+            names=self.names,
+            on_plot=self.on_plot,
+        )
+
+    def plot_predictions(self, batch, preds, ni):
+        """Plots batch predictions with masks and bounding boxes."""
+        plot_images(
+            batch["img"],
+            *output_to_target(preds[0], max_det=15),  # not set to self.args.max_det due to slow plotting speed
+            torch.cat(self.plot_masks, dim=0) if len(self.plot_masks) else self.plot_masks,
+            paths=batch["im_file"],
+            fname=self.save_dir / f"val_batch{ni}_pred.jpg",
+            names=self.names,
+            on_plot=self.on_plot,
+        )  # pred
+        self.plot_masks.clear()
+
+    def save_one_txt(self, predn, pred_masks, save_conf, shape, file):
+        """Save YOLO detections to a txt file in normalized coordinates in a specific format."""
+        from ultralytics.engine.results import Results
+
+        Results(
+            np.zeros((shape[0], shape[1]), dtype=np.uint8),
+            path=None,
+            names=self.names,
+            boxes=predn[:, :6],
+            masks=pred_masks,
+        ).save_txt(file, save_conf=save_conf)
+
+    def pred_to_json(self, predn, filename, pred_masks):
+        """
+        Save one JSON result.
+
+        Examples:
+             >>> result = {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
+        """
+        from pycocotools.mask import encode  # noqa
+
+        def single_encode(x):
+            """Encode predicted masks as RLE and append results to jdict."""
+            rle = encode(np.asarray(x[:, :, None], order="F", dtype="uint8"))[0]
+            rle["counts"] = rle["counts"].decode("utf-8")
+            return rle
+
+        stem = Path(filename).stem
+        image_id = int(stem) if stem.isnumeric() else stem
+        box = ops.xyxy2xywh(predn[:, :4])  # xywh
+        box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+        pred_masks = np.transpose(pred_masks, (2, 0, 1))
+        with ThreadPool(NUM_THREADS) as pool:
+            rles = pool.map(single_encode, pred_masks)
+        for i, (p, b) in enumerate(zip(predn.tolist(), box.tolist())):
+            self.jdict.append(
+                {
+                    "image_id": image_id,
+                    "category_id": self.class_map[int(p[5])],
+                    "bbox": [round(x, 3) for x in b],
+                    "score": round(p[4], 5),
+                    "segmentation": rles[i],
+                }
+            )
+
+    def eval_json(self, stats):
+        """Return COCO-style object detection evaluation metrics."""
+        if self.args.save_json and self.is_coco and len(self.jdict):
+            anno_json = self.data["path"] / "annotations/instances_val2017.json"  # annotations
+            pred_json = self.save_dir / "predictions.json"  # predictions
+            LOGGER.info(f"\nEvaluating pycocotools mAP using {pred_json} and {anno_json}...")
+            try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
+                check_requirements("pycocotools>=2.0.6")
+                from pycocotools.coco import COCO  # noqa
+                from pycocotools.cocoeval import COCOeval  # noqa
+
+                for x in anno_json, pred_json:
+                    assert x.is_file(), f"{x} file not found"
+                anno = COCO(str(anno_json))  # init annotations api
+                pred = anno.loadRes(str(pred_json))  # init predictions api (must pass string, not Path)
+                for i, eval in enumerate([COCOeval(anno, pred, "bbox"), COCOeval(anno, pred, "segm")]):
+                    if self.is_coco:
+                        eval.params.imgIds = [int(Path(x).stem) for x in self.dataloader.dataset.im_files]  # im to eval
+                    eval.evaluate()
+                    eval.accumulate()
+                    eval.summarize()
+                    idx = i * 4 + 2
+                    stats[self.metrics.keys[idx + 1]], stats[self.metrics.keys[idx]] = eval.stats[
+                        :2
+                    ]  # update mAP50-95 and mAP50
+            except Exception as e:
+                LOGGER.warning(f"pycocotools unable to run: {e}")
+        return stats
